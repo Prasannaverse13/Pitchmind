@@ -1,0 +1,6 @@
+agent-framework
+azure-identity
+fastapi
+uvicorn
+python-dotenv
+azure-cosmos

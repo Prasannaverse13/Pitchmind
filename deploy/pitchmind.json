@@ -1,0 +1,271 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "type": "string"
+    },
+    "acrServer": {
+      "type": "string"
+    },
+    "acrUser": {
+      "type": "string"
+    },
+    "acrPass": {
+      "type": "securestring"
+    },
+    "foundryEndpoint": {
+      "type": "string"
+    },
+    "tag": {
+      "type": "string"
+    },
+    "deployWeb": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "cosmosName": {
+      "type": "string"
+    },
+    "cosmosLocation": {
+      "type": "string",
+      "defaultValue": "[parameters('location')]"
+    }
+  },
+  "variables": {
+    "envName": "pitchmind-env",
+    "lawName": "pitchmind-logs"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2022-10-01",
+      "name": "[variables('lawName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30
+      }
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('envName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('lawName'))]"
+      ],
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', variables('lawName')), '2022-10-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', variables('lawName')), '2022-10-01').primarySharedKey]"
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts",
+      "apiVersion": "2024-05-15",
+      "name": "[parameters('cosmosName')]",
+      "location": "[parameters('cosmosLocation')]",
+      "kind": "GlobalDocumentDB",
+      "properties": {
+        "databaseAccountOfferType": "Standard",
+        "locations": [
+          {
+            "locationName": "[parameters('cosmosLocation')]",
+            "failoverPriority": 0,
+            "isZoneRedundant": false
+          }
+        ],
+        "capabilities": [
+          {
+            "name": "EnableServerless"
+          }
+        ],
+        "disableLocalAuth": true,
+        "consistencyPolicy": {
+          "defaultConsistencyLevel": "Session"
+        },
+        "minimalTlsVersion": "Tls12"
+      }
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts/sqlDatabases",
+      "apiVersion": "2024-05-15",
+      "name": "[concat(parameters('cosmosName'), '/pitchmind')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosName'))]"
+      ],
+      "properties": {
+        "resource": {
+          "id": "pitchmind"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers",
+      "apiVersion": "2024-05-15",
+      "name": "[concat(parameters('cosmosName'), '/pitchmind/league')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlDatabases', parameters('cosmosName'), 'pitchmind')]"
+      ],
+      "properties": {
+        "resource": {
+          "id": "league",
+          "partitionKey": {
+            "paths": [
+              "/pk"
+            ],
+            "kind": "Hash"
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments",
+      "apiVersion": "2024-05-15",
+      "name": "[concat(parameters('cosmosName'), '/', guid(resourceGroup().id, parameters('cosmosName'), 'pitchmind-api-data'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosName'))]",
+        "[resourceId('Microsoft.App/containerApps', 'pitchmind-api')]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlRoleDefinitions', parameters('cosmosName'), '00000000-0000-0000-0000-000000000002')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', 'pitchmind-api'), '2024-03-01', 'full').identity.principalId]",
+        "scope": "[resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosName'))]"
+      }
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "pitchmind-api",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', variables('envName'))]",
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers', parameters('cosmosName'), 'pitchmind', 'league')]"
+      ],
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('envName'))]",
+        "configuration": {
+          "ingress": {
+            "external": true,
+            "targetPort": 8000,
+            "transport": "auto",
+            "allowInsecure": false
+          },
+          "registries": [
+            {
+              "server": "[parameters('acrServer')]",
+              "username": "[parameters('acrUser')]",
+              "passwordSecretRef": "acr-pass"
+            }
+          ],
+          "secrets": [
+            {
+              "name": "acr-pass",
+              "value": "[parameters('acrPass')]"
+            }
+          ]
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "api",
+              "image": "[concat(parameters('acrServer'), '/pitchmind-api:', parameters('tag'))]",
+              "resources": {
+                "cpu": 0.5,
+                "memory": "1Gi"
+              },
+              "env": [
+                {
+                  "name": "FOUNDRY_PROJECT_ENDPOINT",
+                  "value": "[parameters('foundryEndpoint')]"
+                },
+                {
+                  "name": "FOUNDRY_MODEL",
+                  "value": "gpt-4o"
+                },
+                {
+                  "name": "USE_AZURE_CLI",
+                  "value": "0"
+                },
+                {
+                  "name": "COSMOS_ENDPOINT",
+                  "value": "[reference(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosName')), '2024-05-15').documentEndpoint]"
+                }
+              ]
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 1
+          }
+        }
+      }
+    },
+    {
+      "condition": "[parameters('deployWeb')]",
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "pitchmind-web",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', variables('envName'))]"
+      ],
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('envName'))]",
+        "configuration": {
+          "ingress": {
+            "external": true,
+            "targetPort": 3000,
+            "transport": "auto",
+            "allowInsecure": false
+          },
+          "registries": [
+            {
+              "server": "[parameters('acrServer')]",
+              "username": "[parameters('acrUser')]",
+              "passwordSecretRef": "acr-pass"
+            }
+          ],
+          "secrets": [
+            {
+              "name": "acr-pass",
+              "value": "[parameters('acrPass')]"
+            }
+          ]
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "web",
+              "image": "[concat(parameters('acrServer'), '/pitchmind-web:', parameters('tag'))]",
+              "resources": {
+                "cpu": 0.5,
+                "memory": "1Gi"
+              }
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 2
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "cosmosEndpoint": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosName')), '2024-05-15').documentEndpoint]"
+    }
+  }
+}

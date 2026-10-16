@@ -1,0 +1,11 @@
+**/.venv
+**/__pycache__
+**/node_modules
+**/.next
+**/.env
+**/.env.local
+.git
+web
+datagen
+data/league.json
+data/league.tmp
