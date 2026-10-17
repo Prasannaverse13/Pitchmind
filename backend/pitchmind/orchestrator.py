@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass, field
 
 from . import stats as S
+from .telemetry import event, span
 
 WINDOW = 10
 MAX_ANALYST_TRIES = 2
@@ -31,21 +32,37 @@ def _json(text: str):
     return json.loads(m.group(0))
 
 
-async def _ask(agent, prompt, state, label, tries=3):
+CALL_TIMEOUT = 40
+
+
+async def _ask(agent, prompt, state, label, tries=3, emit=None):
     last = None
     for attempt in range(1, tries + 1):
         try:
-            resp = await agent.run(prompt)
-            return resp.text
+            with span(f"agent.{label.lower()}", **{"pitchmind.agent": label, "pitchmind.attempt": attempt,
+                                                    "gen_ai.operation.name": "invoke_agent",
+                                                    "pitchmind.prompt_chars": len(prompt)}) as sp:
+                resp = await asyncio.wait_for(agent.run(prompt), timeout=CALL_TIMEOUT)
+                sp.set_attribute("pitchmind.reply_chars", len(resp.text or ""))
+                return resp.text
         except Exception as ex:  # recovery path
             last = ex
-            state.log.append({"agent": label, "event": "retry", "attempt": attempt, "error": str(ex)[:160]})
-            await asyncio.sleep(1.5 * attempt)
+            msg = f"{type(ex).__name__}: {str(ex)[:140]}"
+            print(f"[{label}] attempt {attempt} failed: {msg}", flush=True)
+            state.log.append({"agent": label, "event": "retry", "attempt": attempt, "error": msg})
+            if emit:
+                await emit({"type": "recovery", "note": f"{label} attempt {attempt} failed: {msg}"})
+            await asyncio.sleep(2.0 * attempt)
     state.log.append({"agent": label, "event": "failed", "error": str(last)[:160]})
     raise last
 
 
 async def run_window(team, state: MatchState, start: int, end: int, tone: str, emit):
+    with span("match.window", **{"pitchmind.match_id": state.match.get("match_id"), "pitchmind.window_start": start, "pitchmind.window_end": end}):
+        await _run_window(team, state, start, end, tone, emit)
+
+
+async def _run_window(team, state: MatchState, start: int, end: int, tone: str, emit):
     events = S.window_events(state.match["events"], start, end)
     if not events:
         return
@@ -59,7 +76,7 @@ async def run_window(team, state: MatchState, start: int, end: int, tone: str, e
     for attempt in range(1, MAX_ANALYST_TRIES + 1):
         await emit({"type": "handoff", "from": "Lead", "to": "Analyst", "window": [start, end]})
         try:
-            claims = _json(await _ask(team["analyst"], base + feedback, state, "Analyst"))["insights"]
+            claims = _json(await _ask(team["analyst"], base + feedback, state, "Analyst", emit=emit))["insights"]
         except Exception:
             state.log.append({"agent": "Lead", "event": "skip_window", "window": [start, end]})
             await emit({"type": "recovery", "note": f"Analyst failed for {start}-{end}. Window skipped."})
@@ -68,7 +85,7 @@ async def run_window(team, state: MatchState, start: int, end: int, tone: str, e
         proof_prompt = (f"Claims: {json.dumps(claims)}\nStats: {json.dumps(truth)}\n"
                         f"Events:\n{S.compact_events(events)}")
         try:
-            results = _json(await _ask(team["proof"], proof_prompt, state, "Proof"))["results"]
+            results = _json(await _ask(team["proof"], proof_prompt, state, "Proof", emit=emit))["results"]
         except Exception:
             results = [{"index": i, "verdict": "rejected", "reason": "proof unavailable"} for i in range(len(claims))]
         bad = []
@@ -81,6 +98,9 @@ async def run_window(team, state: MatchState, start: int, end: int, tone: str, e
             else:
                 bad.append({**claims[i], "reason": r["reason"]})
         state.rejected += bad
+        with span("proof.verdict", **{"pitchmind.claims": len(claims), "pitchmind.verified": len(claims) - len(bad), "pitchmind.rejected": len(bad), "pitchmind.window_end": end}) as sp:
+            for b in bad:
+                sp.add_event("claim_rejected", {"reason": str(b.get("reason", ""))[:200], "metric": str(b.get("metric", ""))})
         if verified or not bad:
             break
         feedback = "\nProof rejected your claims: " + json.dumps(bad) + "\nTry again with correct numbers."
@@ -89,7 +109,7 @@ async def run_window(team, state: MatchState, start: int, end: int, tone: str, e
     for ins in verified:
         await emit({"type": "handoff", "from": "Proof", "to": "Story"})
         try:
-            note = (await _ask(team["story"], f"Tone: {tone}\nInsight: {json.dumps(ins)}", state, "Story")).strip()
+            note = (await _ask(team["story"], f"Tone: {tone}\nInsight: {json.dumps(ins)}", state, "Story", emit=emit)).strip()
         except Exception:
             note = ins["claim"]
         ins["note"] = note
@@ -105,7 +125,7 @@ async def run_recap(team, state: MatchState, emit):
               f"Final score: {state.match['final_score']}\nFinal stats: {json.dumps(final)}\n"
               f"Verified insights: {json.dumps(state.insights)}")
     try:
-        state.recap = _json(await _ask(team["recap"], prompt, state, "Recap"))
+        state.recap = _json(await _ask(team["recap"], prompt, state, "Recap", emit=emit))
     except Exception:
         state.recap = {"headline": f"{state.match['home']} {state.match['final_score']}",
                        "summary": "Recap agent unavailable. Showing verified insights only.",
@@ -115,6 +135,24 @@ async def run_recap(team, state: MatchState, emit):
 
 async def run_match(team, match: dict, tone: str, emit, speed: float = 0.0):
     """Replay a match window by window. speed is seconds to pause between windows."""
+    async def traced(msg):
+        t = msg.get("type")
+        if t == "handoff":
+            event("handoff", **{"from": msg.get("from"), "to": msg.get("to"), "claims": msg.get("claims")})
+        elif t == "recovery":
+            event("recovery", note=str(msg.get("note"))[:200])
+        elif t == "insight":
+            event("note_on_air", minute=msg["insight"].get("minute"), metric=msg["insight"].get("metric"))
+        await emit(msg)
+
+    with span("match.run", **{"pitchmind.match_id": match.get("match_id"), "pitchmind.home": match.get("home"), "pitchmind.away": match.get("away"), "pitchmind.tone": tone}) as sp:
+        state = await _run_match(team, match, tone, traced, speed)
+        sp.set_attribute("pitchmind.verified", len(state.insights))
+        sp.set_attribute("pitchmind.rejected", len(state.rejected))
+        return state
+
+
+async def _run_match(team, match: dict, tone: str, emit, speed: float = 0.0):
     state = MatchState(match=match)
     last = max(e["minute"] for e in match["events"])
     for start in range(0, last + 1, WINDOW):

@@ -16,16 +16,18 @@ All data is synthetic. Every club, player and match is fictional. No real Premie
 4. [Microsoft and Azure services used](#microsoft-and-azure-services-used)
 5. [The agent team](#the-agent-team)
 6. [Orchestration flow](#orchestration-flow)
-7. [Failure recovery](#failure-recovery)
-8. [Synthetic data](#synthetic-data)
-9. [Fan game layer](#fan-game-layer)
-10. [Frontend](#frontend)
-11. [API reference](#api-reference)
-12. [Security](#security)
-13. [Project structure](#project-structure)
-14. [Run locally](#run-locally)
-15. [Deploy to Azure](#deploy-to-azure)
-16. [Roadmap](#roadmap)
+7. [Observability](#observability)
+8. [Event driven settlement](#event-driven-settlement)
+9. [Failure recovery](#failure-recovery)
+10. [Synthetic data](#synthetic-data)
+11. [Fan game layer](#fan-game-layer)
+12. [Frontend](#frontend)
+13. [API reference](#api-reference)
+14. [Security](#security)
+15. [Project structure](#project-structure)
+16. [Run locally](#run-locally)
+17. [Deploy to Azure](#deploy-to-azure)
+18. [Roadmap](#roadmap)
 
 ---
 
@@ -79,6 +81,9 @@ flowchart LR
     end
 
     COS[("Azure Cosmos DB for NoSQL<br/>serverless, Entra ID only")]
+    QUE[["Azure Storage Queue<br/>match-events"]]
+    FUNC["Azure Function<br/>settle_match (queue trigger)<br/>Flex Consumption, Python"]
+    AI["Application Insights<br/>traces, dependencies, agent spans"]
     ACR["Azure Container Registry"]
     LAW["Log Analytics workspace"]
     DATA["Synthetic event stream<br/>(datagen + match engine)"]
@@ -95,10 +100,18 @@ flowchart LR
     API --> SC
     AN & PR & ST & RC & FN & SC -- "Entra ID token" --> GPT
     API -- "Entra ID token" --> COS
+    API -- "match.completed event<br/>(managed identity)" --> QUE
+    QUE -- trigger --> FUNC
+    FUNC -- "POST /finish (idempotent)" --> API
+    API -- OpenTelemetry --> AI
+    FUNC -. telemetry .-> AI
+    AI --- LAW
     ACR -. images .-> WEB
     ACR -. images .-> API
     ACA -. logs .-> LAW
 ```
+
+Static copies of both diagrams: [`docs/architecture.png`](docs/architecture.png) and [`docs/match-flow.png`](docs/match-flow.png).
 
 ### How a match flows through the system
 
@@ -111,6 +124,8 @@ sequenceDiagram
     participant P as Proof
     participant S as Story
     participant R as Recap
+    participant Q as Storage Queue
+    participant F as Azure Function
 
     UI->>API: GET /api/stream
     loop every 10 minute window
@@ -134,6 +149,10 @@ sequenceDiagram
     L->>R: final stats + verified insights only
     R-->>L: headline, summary, turning points, player of the match
     L-->>UI: recap, done (verified count, rejected count)
+    API->>Q: match.completed event (Azure Storage Queue)
+    Q->>F: queue trigger (Azure Function)
+    F->>API: POST /finish (idempotent)
+    API->>API: apply trophies, XP, ladder, club chat
 ```
 
 ---
@@ -146,13 +165,18 @@ sequenceDiagram
 | **Microsoft Agent Framework** (`agent-framework` Python package) | Each agent is created with `FoundryChatClient(...).as_agent(name, instructions)`. Six agents share one client and are coordinated by the Lead orchestrator. |
 | **Azure Container Apps** | Runs two containers, `pitchmind-api` (FastAPI, 0.5 vCPU, 1 GiB) and `pitchmind-web` (Next.js, scales 1 to 2 replicas), in one managed environment with HTTPS ingress. |
 | **Azure Cosmos DB for NoSQL** (serverless) | Stores managers, clubs, squads, chat and match history. Database `pitchmind`, container `league`, partition key `/pk`. Key auth is turned off (`disableLocalAuth: true`). |
+| **Azure Functions** (Flex Consumption, Python) | Event driven worker `settle_match`. A queue trigger fires when a match reaches full time on the server and settles the result (trophies, XP, ladder), even if the viewer closed the page. |
+| **Azure Storage Queue** | Event bus between the API and the Function. Queue `match-events`, message type `match.completed`. The API publishes with a managed identity (Storage Queue Data Message Sender). The Function reads with its own identity (Storage Queue Data Contributor). Failed messages retry 5 times, then go to the poison queue. |
+| **Application Insights** (with OpenTelemetry) | Traces every agent call, every 10 minute window, every Proof verdict and the full time settlement. See [Observability](#observability). |
 | **Microsoft Entra ID / managed identity** | The API container has a system assigned managed identity. It gets the **Azure AI User** role on Foundry and the **Cosmos DB Built-in Data Contributor** role on Cosmos. No keys are stored in the app. |
 | **Azure Container Registry** | `az acr build` builds both Docker images in the cloud, so no local Docker is needed. |
-| **Log Analytics workspace** | Collects console logs from the Container Apps environment, including agent retries and recovery notes. |
-| **Azure Resource Manager template** | `deploy/pitchmind.json` declares the environment, both apps, Cosmos account, database, container and role assignment. |
-| **Azure CLI** | `deploy/deploy.ps1` runs the full deploy with built in `az` commands only. |
+| **Log Analytics workspace** | Backs Application Insights and collects console logs from the Container Apps environment, including agent retries and recovery notes. |
+| **Azure Resource Manager template** | `deploy/pitchmind.json` declares the Container Apps environment, both apps, Cosmos account, database, container, Application Insights, the storage account and queue, and all role assignments. |
+| **Azure CLI** | `deploy/deploy.ps1` runs the full deploy with built in `az` commands. `deploy/deploy-functions.ps1` publishes the Function. |
 | **Azure Identity SDK** | `DefaultAzureCredential` in Azure, `AzureCliCredential` on a developer machine. |
 | **Azure Cosmos DB Python SDK** | `azure-cosmos` with Entra ID credentials for the league store. |
+| **Azure Monitor OpenTelemetry distro** | `azure-monitor-opentelemetry` sends traces and logs to Application Insights. |
+| **Azure Storage Queue SDK** | `azure-storage-queue` publishes events with Entra ID credentials. |
 
 ---
 
@@ -161,9 +185,9 @@ sequenceDiagram
 | Agent | Type | Job | Output |
 |---|---|---|---|
 | **Lead** | Python orchestrator | Splits the match into windows, computes ground truth stats, routes work, retries, applies fallbacks, streams every step | SSE messages |
-| **Analyst** | Agent Framework agent on gpt-4o | Finds up to 3 claims per window. Every claim must name a metric, a value and event IDs | JSON insights |
+| **Analyst** | Agent Framework agent on gpt-4o | Finds 1 to 3 claims per window. Every claim must name a metric, a value and event IDs | JSON insights |
 | **Proof** | Agent Framework agent on gpt-4o | Checks each claim against stats computed in code and the raw events. Verifies or rejects with a reason | JSON verdicts |
-| **Story** | Agent Framework agent on gpt-4o | Turns one verified insight into a short note in the chosen tone (broadcast, pundit, hype) | Text |
+| **Story** | Agent Framework agent on gpt-4o | Turns one verified insight into a short note in the chosen tone (broadcast, pundit, family) | Text |
 | **Recap** | Agent Framework agent on gpt-4o | Writes the full time report from verified insights only | JSON headline, summary, turning points, player of the match, voiceover |
 | **Fan** | Agent Framework agent on gpt-4o | Rewrites a note for a kids, casual or tactical fan, keeping every fact the same | Text |
 | **Scout** | Agent Framework agent on gpt-4o | Builds a fictional club from a manager's idea: name, motto, colours, style, 11 players | JSON club |
@@ -220,6 +244,35 @@ The UI shows the live agent pipeline, a handoff trace and an AI overview with ve
 
 ---
 
+## Observability
+
+The API is instrumented with OpenTelemetry and sends data to **Application Insights** when `APPLICATIONINSIGHTS_CONNECTION_STRING` is set (Azure sets it automatically). Locally the same calls are no-ops.
+
+| Span | Attributes | Why it matters |
+|---|---|---|
+| `match.run` | match id, teams, tone, verified count, rejected count | One trace per match |
+| `match.window` | match id, window start and end | Time spent per 10 minute window |
+| `agent.analyst`, `agent.proof`, `agent.story`, `agent.recap` | agent name, attempt number, prompt size, reply size, `gen_ai.operation.name` | Latency, retries and failures per agent |
+| `proof.verdict` | claims, verified, rejected, and a `claim_rejected` event with the reason | Shows exactly what Proof stopped |
+| `match.full_time` | match id, `settled_by` (`azure-function` or `api`) | Shows the event driven path |
+
+Agent handoffs and recoveries are recorded as span events on the window trace. Open **Application Insights > Investigate > Transaction search** to follow a match, or **Application map** to see the API, Foundry and Cosmos DB calls together. `GET /api/health` reports `telemetry` and `events` as `true` when both are wired up.
+
+---
+
+## Event driven settlement
+
+When a match finishes on the server, the API publishes a `match.completed` event to an Azure Storage Queue. An Azure Function picks it up and tells the API to settle the result.
+
+1. The agent stream reaches full time on the server, whether or not the viewer is still connected.
+2. `announce_full_time` queues `{"type": "match.completed", "match_id": "..."}`.
+3. The `settle_match` Function (queue trigger) calls `POST /api/challenge/{id}/finish`.
+4. The API applies trophies, XP and the ladder once. The endpoint is idempotent, so retries and the page's own call at full time are safe.
+
+If the queue is not configured (local runs) the API settles in process, so the game works everywhere. Function code is in `functions/`.
+
+---
+
 ## Failure recovery
 
 | Failure | What happens |
@@ -231,6 +284,8 @@ The UI shows the live agent pipeline, a handoff trace and an AI overview with ve
 | Story fails | The verified claim text is shown as is. |
 | Recap fails | A fallback recap with the final score and verified insights is shown. |
 | Scout fails or takes over 45s | An offline club builder creates a club so the user is never stuck. |
+| Queue publish fails | The API settles the match in process instead. |
+| Function cannot settle (API busy) | The queue retries up to 5 times, then moves the message to the poison queue. A 404 (match no longer in API memory) is dropped. |
 | Cosmos DB not ready | The league API returns 503 "warming up" and retries the connection every 8 seconds. |
 | Stream goes quiet | The UI shows "Agents thinking" with a timer and reports a lost stream after 25 seconds. |
 
@@ -288,7 +343,7 @@ PitchMind adds a light club game so fans come back:
 | GET | `/api/club/rivals` | Nearest rivals |
 | GET | `/api/ladder` | Trophy ladder |
 | POST | `/api/challenge` | Start a match against a rival |
-| POST | `/api/challenge/{id}/finish` | Apply the result once |
+| POST | `/api/challenge/{id}/finish` | Settle the result once. Called by the Azure Function and by the page |
 
 The manager is identified by the `X-User` header.
 
@@ -298,7 +353,8 @@ The manager is identified by the `X-User` header.
 
 * **No secrets in code.** Foundry and Cosmos DB are reached with Entra ID tokens through managed identity in Azure and `az login` locally.
 * **Cosmos DB key auth is disabled.** Only identities with the data role can read or write.
-* **Least privilege roles.** Azure AI User on the Foundry resource only. Cosmos DB Built-in Data Contributor on one account only.
+* **Least privilege roles.** Azure AI User on the Foundry resource only. Cosmos DB Built-in Data Contributor on one account only. The API can only send queue messages. The Function can only use the queue.
+* **Keyless event bus.** Both the API and the Function reach the queue with managed identities.
 * **Input limits.** Club ideas are capped at 400 characters, chat at 240, names at 28. AI drafts are cleaned before saving.
 * `.env` files are git ignored.
 
@@ -320,7 +376,9 @@ pitchmind/
 │       ├── stats.py            Ground truth stats computed in code
 │       ├── engine.py           Match simulation for user clubs
 │       ├── league.py           Managers, clubs, chat, ladder, trophies
-│       └── store.py            Cosmos DB store with local file fallback
+│       ├── store.py            Cosmos DB store with local file fallback
+│       ├── telemetry.py        OpenTelemetry spans to Application Insights
+│       └── events.py           Storage Queue publisher
 ├── web/
 │   ├── app/
 │   │   ├── page.tsx            Landing page
@@ -331,11 +389,16 @@ pitchmind/
 │   │   ├── commentary.ts       Play by play calls
 │   │   └── sim.ts              Player movement between events
 │   └── Dockerfile
+├── functions/
+│   ├── function_app.py         Queue triggered settlement Function
+│   ├── host.json
+│   └── requirements.txt
 ├── datagen/generate_match.py   Synthetic match generator
 ├── data/match_001.json         Demo match
 ├── deploy/
 │   ├── pitchmind.json          ARM template
-│   └── deploy.ps1              One command deploy
+│   ├── deploy.ps1              One command deploy
+│   └── deploy-functions.ps1    Publishes the Azure Function
 └── backend.Dockerfile
 ```
 
@@ -405,11 +468,12 @@ The script:
 1. Finds the Foundry resource and registers the needed resource providers.
 2. Creates the resource group and Azure Container Registry.
 3. Builds the API image with `az acr build`.
-4. Deploys the ARM template: Log Analytics, Container Apps environment, API app with managed identity, Cosmos DB account, database, container and data role.
+4. Deploys the ARM template: Log Analytics, Application Insights, Container Apps environment, API app with managed identity, Cosmos DB account, database and container, storage account with the `match-events` queue, and the data roles.
 5. Grants the API identity the Azure AI User role on Foundry.
 6. Grants your own account Cosmos access for local development.
 7. Builds and deploys the web image with the API URL.
-8. Waits for `/api/health` to report the league ready.
+8. Publishes the `settle_match` Azure Function (Flex Consumption) with its own identity and queue access. This step is optional: if it is skipped, the API settles in process.
+9. Waits for `/api/health` to report the league ready.
 
 Set `PITCHMIND_COSMOS_LOCATION` to choose a different Cosmos DB region.
 
@@ -417,15 +481,8 @@ Set `PITCHMIND_COSMOS_LOCATION` to choose a different Cosmos DB region.
 
 ## Roadmap
 
-* Application Insights tracing for each agent handoff and Proof verdict.
 * Azure AI Speech neural voices for spoken commentary.
-* Azure Functions to settle match results server side, even if the viewer closes the page.
 * Shared live viewing for club mates through Azure Web PubSub.
 * Managed identity image pulls from Azure Container Registry instead of admin credentials.
-* Event Grid events for broadcaster integrations (goal, verified insight, full time).
-
----
-
-## License
-
-MIT
+* More events on the queue (goal, verified insight) for broadcaster and studio integrations through Event Grid.
+* Run agent evaluations in Foundry against the synthetic match set to track Proof accuracy over time.

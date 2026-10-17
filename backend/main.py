@@ -16,6 +16,8 @@ from fastapi.responses import StreamingResponse
 
 load_dotenv()
 
+from pitchmind import events as bus  # noqa: E402
+from pitchmind import telemetry  # noqa: E402
 from pitchmind.agents import build_team  # noqa: E402
 from pitchmind.engine import play  # noqa: E402
 from pitchmind.league import League, clean_club, random_club  # noqa: E402
@@ -23,6 +25,7 @@ from pitchmind.orchestrator import _json, run_match  # noqa: E402
 
 DATA = Path(__file__).resolve().parent.parent / "data" / "match_001.json"
 
+telemetry.init()
 app = FastAPI(title="PitchMind")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 _team = None
@@ -75,7 +78,8 @@ def kits(home: dict, away: dict):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "model": os.environ.get("FOUNDRY_MODEL", "gpt-4o"), "league": league.status()}
+    return {"ok": True, "model": os.environ.get("FOUNDRY_MODEL", "gpt-4o"), "league": league.status(),
+            "telemetry": bool(os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING")), "events": bus.enabled()}
 
 
 @app.get("/api/match")
@@ -110,6 +114,8 @@ async def stream(tone: str = "broadcast", speed: float = 0.0, match: str | None 
     async def worker():
         try:
             await run_match(team(), m, tone, emit, speed)
+            if match and match in MATCHES:
+                await asyncio.to_thread(announce_full_time, match)
         except Exception as ex:
             await queue.put({"type": "error", "message": str(ex)[:300]})
         await queue.put(None)
@@ -242,12 +248,31 @@ def challenge(body: dict, x_user: str = Header(default="")):
     return {"match": mid, "home": mine["name"], "away": opp["name"]}
 
 
-@app.post("/api/challenge/{mid}/finish")
-def finish(mid: str):
-    """Called at full time. Applies trophies once."""
+def settle(mid: str):
+    """Apply a finished match to the ladder. Safe to call many times: trophies are applied once."""
     info = MATCHES.get(mid)
     if not info:
         raise HTTPException(404, "Match not found.")
     if not info["done"]:
         info["done"] = guard(lambda: league.record(info["home"], info["away"], info["match"]["final_score"], mid, info["by"]))
-    return {"result": info["done"]}
+    return info["done"]
+
+
+def announce_full_time(mid: str):
+    """Full time reached on the server. Queue an event so the Azure Function settles the result.
+    With no queue configured, settle right here instead. Either way it works if the page was closed."""
+    with telemetry.span("match.full_time", **{"pitchmind.match_id": mid}) as sp:
+        if bus.publish("match.completed", {"match_id": mid}):
+            sp.set_attribute("pitchmind.settled_by", "azure-function")
+            return
+        sp.set_attribute("pitchmind.settled_by", "api")
+        try:
+            settle(mid)
+        except Exception as ex:
+            print(f"[Settle] {type(ex).__name__}: {str(ex)[:120]}", flush=True)
+
+
+@app.post("/api/challenge/{mid}/finish")
+def finish(mid: str):
+    """Settles the match. Called by the Azure Function, or by the page at full time. Applies trophies once."""
+    return {"result": settle(mid)}

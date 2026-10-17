@@ -18,6 +18,7 @@ $sub = az account show --query id -o tsv
 $tag = ($sub -replace "-", "").Substring(0, 6)
 $acr = "pitchmindacr$tag"
 $cosmos = "pitchmind-cosmos-$tag"
+$storage = "pitchmindq$tag"      # Storage account that holds the match-events queue
 # Cosmos DB serverless is sometimes full in a region. Set $env:PITCHMIND_COSMOS_LOCATION (for example "centralindia") to use another one.
 $cosmosLoc = if ($env:PITCHMIND_COSMOS_LOCATION) { $env:PITCHMIND_COSMOS_LOCATION } else { $loc }
 $endpoint = "https://pitchmind-foundry.services.ai.azure.com/api/projects/pitchmind"
@@ -25,7 +26,7 @@ $ver = Get-Date -Format "yyyyMMddHHmmss"
 Write-Host "Resource group: $rg   Region: $loc   Registry: $acr   Cosmos: $cosmos ($cosmosLoc)   Version: $ver"
 
 Step "Register Azure providers (first time takes a few minutes)"
-foreach ($p in "Microsoft.App", "Microsoft.ContainerRegistry", "Microsoft.OperationalInsights", "Microsoft.DocumentDB") {
+foreach ($p in "Microsoft.App", "Microsoft.ContainerRegistry", "Microsoft.OperationalInsights", "Microsoft.DocumentDB", "Microsoft.Insights", "Microsoft.Storage", "Microsoft.Web") {
   az provider register --namespace $p --wait | Out-Null; AzOk
 }
 
@@ -52,6 +53,7 @@ function Deploy($withWeb) {
       deployWeb       = @{ value = $withWeb }
       cosmosName      = @{ value = $cosmos }
       cosmosLocation  = @{ value = $cosmosLoc }
+      storageName     = @{ value = $storage }
     }
   }
   $file = Join-Path $env:TEMP "pitchmind-params.json"
@@ -60,7 +62,7 @@ function Deploy($withWeb) {
   Remove-Item $file -ErrorAction SilentlyContinue
 }
 
-Step "Create Cosmos DB, the environment and the API (first run takes about 5 to 10 minutes)"
+Step "Create Cosmos DB, Application Insights, the event queue, the environment and the API (first run takes about 5 to 10 minutes)"
 Deploy $false
 
 Step "Let the API use Foundry (Azure AI User role)"
@@ -91,6 +93,12 @@ Step "Deploy the web app"
 Deploy $true
 $webHost = az resource show --resource-group $rg --resource-type Microsoft.App/containerApps --name pitchmind-web --api-version 2024-03-01 --query properties.configuration.ingress.fqdn -o tsv; AzOk
 
+Step "Deploy the settlement function (Azure Functions, queue trigger). Optional: the API settles in process if this is skipped"
+$ErrorActionPreference = "Continue"
+try { & "$PSScriptRoot\deploy-functions.ps1" -ResourceGroup $rg -Location $loc -Storage $storage -Tag $tag -ApiUrl $apiUrl }
+catch { Write-Host "Function deploy skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
+$ErrorActionPreference = "Stop"
+
 Step "Check (waits for the API and the Cosmos DB league)"
 $ok = $false
 for ($i = 0; $i -lt 18; $i++) {
@@ -106,4 +114,5 @@ if (-not $ok) { Write-Host "League storage is not ready yet. New Cosmos roles ca
 
 Write-Host "`nDONE" -ForegroundColor Green
 Write-Host "Open the app:  https://$webHost"
-Write-Host "API health:    $apiUrl/api/health"
+Write-Host "API health:    $apiUrl/api/health   (shows telemetry and events as true when wired up)"
+Write-Host "Tracing:       Azure portal > pitchmind-insights > Investigate > Transaction search / Application map"

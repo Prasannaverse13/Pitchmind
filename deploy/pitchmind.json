@@ -30,6 +30,9 @@
     "cosmosLocation": {
       "type": "string",
       "defaultValue": "[parameters('location')]"
+    },
+    "storageName": {
+      "type": "string"
     }
   },
   "variables": {
@@ -66,6 +69,45 @@
           }
         }
       }
+    },
+    {
+      "type": "Microsoft.Insights/components",
+      "apiVersion": "2020-02-02",
+      "name": "pitchmind-insights",
+      "location": "[parameters('location')]",
+      "kind": "web",
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', variables('lawName'))]"
+      ],
+      "properties": {
+        "Application_Type": "web",
+        "IngestionMode": "LogAnalytics",
+        "WorkspaceResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', variables('lawName'))]"
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('storageName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "StorageV2",
+      "properties": {
+        "minimumTlsVersion": "TLS1_2",
+        "allowBlobPublicAccess": false,
+        "supportsHttpsTrafficOnly": true
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/queueServices/queues",
+      "apiVersion": "2023-05-01",
+      "name": "[concat(parameters('storageName'), '/default/match-events')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageName'))]"
+      ],
+      "properties": {}
     },
     {
       "type": "Microsoft.DocumentDB/databaseAccounts",
@@ -141,6 +183,21 @@
       }
     },
     {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[concat('Microsoft.Storage/storageAccounts/', parameters('storageName'))]",
+      "name": "[guid(resourceGroup().id, parameters('storageName'), 'pitchmind-api-queue-sender')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageName'))]",
+        "[resourceId('Microsoft.App/containerApps', 'pitchmind-api')]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'c6a89b2d-59bc-44d0-9896-0f6e12d7b80a')]",
+        "principalId": "[reference(resourceId('Microsoft.App/containerApps', 'pitchmind-api'), '2024-03-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    },
+    {
       "type": "Microsoft.App/containerApps",
       "apiVersion": "2024-03-01",
       "name": "pitchmind-api",
@@ -150,7 +207,9 @@
       },
       "dependsOn": [
         "[resourceId('Microsoft.App/managedEnvironments', variables('envName'))]",
-        "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers', parameters('cosmosName'), 'pitchmind', 'league')]"
+        "[resourceId('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers', parameters('cosmosName'), 'pitchmind', 'league')]",
+        "[resourceId('Microsoft.Insights/components', 'pitchmind-insights')]",
+        "[resourceId('Microsoft.Storage/storageAccounts/queueServices/queues', parameters('storageName'), 'default', 'match-events')]"
       ],
       "properties": {
         "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('envName'))]",
@@ -200,6 +259,14 @@
                 {
                   "name": "COSMOS_ENDPOINT",
                   "value": "[reference(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosName')), '2024-05-15').documentEndpoint]"
+                },
+                {
+                  "name": "APPLICATIONINSIGHTS_CONNECTION_STRING",
+                  "value": "[reference(resourceId('Microsoft.Insights/components', 'pitchmind-insights'), '2020-02-02').ConnectionString]"
+                },
+                {
+                  "name": "STORAGE_QUEUE_URL",
+                  "value": "[concat('https://', parameters('storageName'), '.queue.core.windows.net/match-events')]"
                 }
               ]
             }
@@ -266,6 +333,14 @@
     "cosmosEndpoint": {
       "type": "string",
       "value": "[reference(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('cosmosName')), '2024-05-15').documentEndpoint]"
+    },
+    "storageName": {
+      "type": "string",
+      "value": "[parameters('storageName')]"
+    },
+    "insightsName": {
+      "type": "string",
+      "value": "pitchmind-insights"
     }
   }
 }

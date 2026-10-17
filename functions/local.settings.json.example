@@ -1,0 +1,9 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "StorageConn__queueServiceUri": "https://<storage>.queue.core.windows.net",
+    "API_URL": "http://localhost:8000"
+  }
+}
